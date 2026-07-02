@@ -1,24 +1,99 @@
 #!/bin/sh
 # Author: Qiu
 # License: BSD 2-Clause "Simplified" License
-# This script gets the CWD of the focued view. On error xcwd is used -
-# this allows the script to also work on xwayland views.
-# Tested on FreeBSD and Linux.
+# This script gets the CWD of the focused view. For terminal emulators it
+# resolves the shell CWD instead of the terminal's own launch directory.
+# Falls back to xcwd for Xwayland views.
 
 # Get the view tree
 getTree() { swaymsg -t get_tree; }
-# Find the focused view in the tree
-filter() { jq -c 'getpath(path(.. .focused? // empty)[:-1]).pid'; }
 
-# Find the PID of the process
-PID=$(getTree | filter)
+# Known terminal emulator app_ids (lowercased for matching)
+is_terminal() {
+	case "$(echo "$1" | tr '[:upper:]' '[:lower:]')" in
+		alacritty|kitty|foot|gnome-terminal|gnome-terminal-server|\
+		tilix|wevterm|rio|xfce4-terminal|sakura|terminator|\
+		konsole|qterminal|lxterminal|tilda|guake|hyper|\
+		contour|cool-retro-term|termite|termite-client|\
+		st|st-*|xterm|uxterm|rxvt|rxvt-unicode|urxvt) return 0 ;;
+		*) return 1 ;;
+	esac
+}
 
-# Print the current working directory
-if [ "$(uname)" == "FreeBSD" ]
-then
-	STAT="$(procstat -f $PID 2>/dev/null)"
-	[ "$?" -eq "0" ] && (echo "$STAT" | awk '$3 == "cwd" { print $10 }') || xcwd
-elif [ "$(uname)" == "Linux" ]
-then
-	readlink -e "/proc/$PID/cwd" 2>/dev/null || xcwd
-fi
+# List child PIDs for a given PID (tries multiple methods for portability)
+child_pids() {
+	# /proc/<pid>/children exists only if CONFIG_PROC_CHILDREN=y
+	cat "/proc/$1/children" 2>/dev/null
+	# pgrep is widely available on Linux
+	pgrep -P "$1" 2>/dev/null
+	# ps fallback
+	ps --ppid "$1" -o pid= 2>/dev/null
+}
+
+# Find a shell among children of a given PID (one level only)
+find_child_shells() {
+	for child in $(child_pids "$1" | sort -u); do
+		case "$(cat "/proc/$child/comm" 2>/dev/null)" in
+			zsh|bash|fish|dash|sh|tcsh|csh|ksh|ksh93|mksh|\
+			nu|ion|elvish|xonsh|yash|rc|es|scsh|osh) echo "$child" ;;
+		esac
+	done
+}
+
+# Recursively find a shell, preferring shallower depth (BFS up to depth 3)
+find_shell() {
+	local pid depth
+	pid="$1"
+	depth="${2:-0}"
+	[ "$depth" -ge 3 ] && return 1
+
+	local shells
+	shells=$(find_child_shells "$pid")
+	if [ -n "$shells" ]; then
+		# Return the first shell found (usually the right one for single-window)
+		echo "$shells" | head -1
+		return 0
+	fi
+
+	# Recurse one level deeper
+	for child in $(child_pids "$pid" | sort -u); do
+		local found
+		found=$(find_shell "$child" $((depth + 1)))
+		[ -n "$found" ] && echo "$found" && return 0
+	done
+	return 1
+}
+
+# Main
+main() {
+	# Extract focused window PID and app_id from sway tree
+	local PID APP_ID
+	eval "$(getTree | jq -r '
+		getpath(path(.. .focused? // empty)[:-1]) |
+		"PID=\(.pid // "")\nAPP_ID=\(.app_id // "")\nXCLASS=\(.window_properties.class // "")"
+	')"
+
+	[ -z "$PID" ] && xcwd && return
+
+	# If this is a terminal emulator, try to find the shell's CWD
+	if is_terminal "$APP_ID" || is_terminal "$XCLASS"; then
+		local SHELL_PID
+		SHELL_PID=$(find_shell "$PID")
+		if [ -n "$SHELL_PID" ]; then
+			local CWD
+			CWD=$(readlink -e "/proc/$SHELL_PID/cwd" 2>/dev/null)
+			[ -n "$CWD" ] && echo "$CWD" && return
+		fi
+	fi
+
+	# Fallback: use the window PID's own CWD
+	if [ "$(uname)" = "FreeBSD" ]; then
+		local STAT
+		STAT="$(procstat -f "$PID" 2>/dev/null)"
+		[ "$?" -eq "0" ] && echo "$STAT" | awk '$3 == "cwd" { print $10 }' || xcwd
+	elif [ "$(uname)" = "Linux" ]; then
+		readlink -e "/proc/$PID/cwd" 2>/dev/null || xcwd
+	fi
+}
+
+main
